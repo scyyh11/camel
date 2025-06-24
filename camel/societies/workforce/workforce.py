@@ -674,8 +674,8 @@ class Workforce(BaseNode):
             # Reset state for tasks being moved back to pending
             for task in tasks_to_move_back:
                 # Handle all possible task states
-                if task.state in [TaskState.DONE, TaskState.FAILED]:
-                    task.state = TaskState.OPEN
+                if task.state in [TaskState.DONE, TaskState.OPEN]:
+                    task.state = TaskState.FAILED  # TODO: Add logic for OPEN
                     # Clear result to avoid confusion
                     task.result = None
                     # Reset failure count to give task a fresh start
@@ -881,12 +881,17 @@ class Workforce(BaseNode):
         self.reset()
         self._task = task
         self._state = WorkforceState.RUNNING
-        task.state = TaskState.OPEN
-        self._pending_tasks.append(task)
+        task.state = TaskState.FAILED  # TODO: Add logic for OPEN
 
         # Decompose the task into subtasks first
         subtasks = self._decompose_task(task)
-        self._pending_tasks.extendleft(reversed(subtasks))
+        if subtasks:
+            # If decomposition happened, the original task becomes a container.
+            # We only execute its subtasks.
+            self._pending_tasks.extendleft(reversed(subtasks))
+        else:
+            # If no decomposition, execute the original task.
+            self._pending_tasks.append(task)
         self.set_channel(TaskChannel())
 
         # Save initial snapshot
@@ -998,21 +1003,23 @@ class Workforce(BaseNode):
         self,
         description: str,
         worker: ChatAgent,
-        max_concurrent_tasks: int = 10,
+        pool_max_size: int = 10,
     ) -> Workforce:
         r"""Add a worker node to the workforce that uses a single agent.
 
         Args:
             description (str): Description of the worker node.
             worker (ChatAgent): The agent to be added.
-            max_concurrent_tasks (int): Maximum number of tasks this worker can
-                process concurrently. (default: :obj:`10`)
+            pool_max_size (int): Maximum size of the agent pool.
+                (default: :obj:`10`)
 
         Returns:
             Workforce: The workforce node itself.
         """
         worker_node = SingleAgentWorker(
-            description, worker, max_concurrent_tasks
+            description=description,
+            worker=worker,
+            pool_max_size=pool_max_size,
         )
         self._children.append(worker_node)
         if self.metrics_logger:
@@ -1194,6 +1201,13 @@ class Workforce(BaseNode):
         response = self.coordinator_agent.step(
             prompt, response_format=TaskAssignResult
         )
+        if response.msg is None or response.msg.content is None:
+            logger.error(
+                "Coordinator agent returned empty response for task assignment"
+            )
+            # Return empty result as fallback
+            return TaskAssignResult(assignments=[])
+
         result_dict = json.loads(response.msg.content, parse_int=str)
         task_assign_result = TaskAssignResult(**result_dict)
         return task_assign_result
@@ -1231,8 +1245,21 @@ class Workforce(BaseNode):
         response = self.coordinator_agent.step(
             prompt, response_format=WorkerConf
         )
-        result_dict = json.loads(response.msg.content)
-        new_node_conf = WorkerConf(**result_dict)
+        if response.msg is None or response.msg.content is None:
+            logger.error(
+                "Coordinator agent returned empty response for worker creation"
+            )
+            # Create a fallback worker configuration
+            new_node_conf = WorkerConf(
+                description=f"Fallback worker for "
+                f"task: {task.content[:50]}...",
+                role="General Assistant",
+                sys_msg="You are a general assistant that can help "
+                "with various tasks.",
+            )
+        else:
+            result_dict = json.loads(response.msg.content)
+            new_node_conf = WorkerConf(**result_dict)
 
         new_agent = self._create_new_agent(
             new_node_conf.role,
@@ -1242,7 +1269,7 @@ class Workforce(BaseNode):
         new_node = SingleAgentWorker(
             description=new_node_conf.description,
             worker=new_agent,
-            max_concurrent_tasks=10,  # TODO: make this configurable
+            pool_max_size=10,  # TODO: make this configurable
         )
         new_node.set_channel(self._channel)
 
@@ -1384,10 +1411,10 @@ class Workforce(BaseNode):
                 metadata={'failure_count': task.failure_count},
             )
 
-        if task.failure_count >= 3:
+        if task.failure_count > 3:
             return True
 
-        if task.get_depth() >= 3:
+        if task.get_depth() > 3:
             # Create a new worker node and reassign
             assignee = self._create_worker_node_for_task(task)
 
@@ -1685,7 +1712,7 @@ class Workforce(BaseNode):
                     await self._graceful_shutdown(returned_task)
                     break
                 elif returned_task.state == TaskState.OPEN:
-                    # TODO: multi-layer workforce
+                    # TODO: Add logic for OPEN
                     pass
                 else:
                     raise ValueError(
@@ -1797,7 +1824,7 @@ class Workforce(BaseNode):
                 new_instance.add_single_agent_worker(
                     child.description,
                     cloned_worker,
-                    child.max_concurrent_tasks,
+                    pool_max_size=10,
                 )
             elif isinstance(child, RolePlayingWorker):
                 new_instance.add_role_playing_worker(
@@ -1808,7 +1835,6 @@ class Workforce(BaseNode):
                     child.user_agent_kwargs,
                     child.summarize_agent_kwargs,
                     child.chat_turn_limit,
-                    child.max_concurrent_tasks,
                 )
             elif isinstance(child, Workforce):
                 new_instance.add_workforce(child.clone(with_memory))
